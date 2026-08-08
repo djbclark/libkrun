@@ -19,6 +19,7 @@ use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
     accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
 };
+use nix::sys::time::TimeVal;
 
 #[cfg(target_os = "macos")]
 use super::super::super::linux_errno::linux_errno_raw;
@@ -29,6 +30,11 @@ use super::super::proxy::{
     NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
 use utils::epoll::EventSet;
+
+// Currently the VM can hang indefinitely due to a stuck peer,
+// and ideally the code should be restructured to prevent this from happening,
+// but as a bandaid fix we simply add a time limit to how long the VM can hang for.
+const SEND_TIMEOUT: TimeVal = TimeVal::new(10, 0);
 
 pub(crate) fn create_socket(
     id: u64,
@@ -230,6 +236,9 @@ pub(crate) fn switch_to_connected(proxy: &mut super::TsiStreamProxy) {
         },
         Err(e) => error!("couldn't obtain fd flags id={}, err={}", proxy.id, e),
     };
+    if let Err(e) = setsockopt(&proxy.fd, sockopt::SendTimeout, &SEND_TIMEOUT) {
+        warn!("error setting send timeout: id={}, err={}", proxy.id, e);
+    }
 }
 
 fn get_addr_len(proxy: &super::TsiStreamProxy, addr: &SockaddrStorage) -> Option<u32> {
@@ -379,6 +388,15 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> P
                 sent as i32
             }
             Err(err) => {
+                warn!(
+                    "error sending data to peer, closing connection: id={}, err={}",
+                    proxy.id, err
+                );
+                proxy.push_reset();
+                proxy.status = ProxyStatus::Closed;
+                update.signal_queue = true;
+                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+                update.remove_proxy = ProxyRemoval::Deferred;
                 #[cfg(target_os = "macos")]
                 let errno = -linux_errno_raw(err as i32);
                 #[cfg(target_os = "linux")]
