@@ -19,7 +19,6 @@ use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
     accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
 };
-use nix::sys::time::TimeVal;
 
 #[cfg(target_os = "macos")]
 use super::super::super::linux_errno::linux_errno_raw;
@@ -30,11 +29,6 @@ use super::super::proxy::{
     NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
 use utils::epoll::EventSet;
-
-// Currently the VM can hang indefinitely due to a stuck peer,
-// and ideally the code should be restructured to prevent this from happening,
-// but as a bandaid fix we simply add a time limit to how long the VM can hang for.
-const SEND_TIMEOUT: TimeVal = TimeVal::new(10, 0);
 
 pub(crate) fn create_socket(
     id: u64,
@@ -228,7 +222,7 @@ pub(crate) fn switch_to_connected(proxy: &mut super::TsiStreamProxy) {
     match fcntl(&proxy.fd, FcntlArg::F_GETFL) {
         Ok(flags) => match OFlag::from_bits(flags) {
             Some(flags) => {
-                if let Err(e) = fcntl(&proxy.fd, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK)) {
+                if let Err(e) = fcntl(&proxy.fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
                     warn!("error switching to blocking: id={}, err={}", proxy.id, e);
                 }
             }
@@ -236,9 +230,58 @@ pub(crate) fn switch_to_connected(proxy: &mut super::TsiStreamProxy) {
         },
         Err(e) => error!("couldn't obtain fd flags id={}, err={}", proxy.id, e),
     };
-    if let Err(e) = setsockopt(&proxy.fd, sockopt::SendTimeout, &SEND_TIMEOUT) {
-        warn!("error setting send timeout: id={}, err={}", proxy.id, e);
+}
+
+pub(crate) fn try_send(proxy: &mut super::TsiStreamProxy, update: &mut ProxyUpdate) {
+    if !proxy.pending_tx.is_empty() {
+        #[cfg(target_os = "macos")]
+        let flags = MsgFlags::empty();
+        #[cfg(target_os = "linux")]
+        let flags = MsgFlags::MSG_NOSIGNAL;
+
+        match send(proxy.fd.as_raw_fd(), &proxy.pending_tx, flags) {
+            Ok(sent) => {
+                proxy.pending_tx.drain(..sent);
+                proxy.tx_cnt += Wrapping(sent as u32);
+            }
+            Err(Errno::EWOULDBLOCK) => {}
+            Err(err) => {
+                warn!(
+                    "error sending data to peer, closing connection: id={}, err={}",
+                    proxy.id, err
+                );
+                proxy.push_reset();
+                proxy.status = ProxyStatus::Closed;
+                update.signal_queue = true;
+                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+                update.remove_proxy = ProxyRemoval::Deferred;
+                return;
+            }
+        }
     }
+
+    if (proxy.tx_cnt - proxy.last_tx_cnt_sent).0 >= proxy.peer_buf_alloc / 2 {
+        debug!(
+            "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
+            proxy.id, proxy.tx_cnt, proxy.last_tx_cnt_sent
+        );
+        proxy.last_tx_cnt_sent = proxy.tx_cnt;
+        // This packet goes to the connection.
+        let rx = MuxerRx::CreditUpdate {
+            local_port: proxy.local_port,
+            peer_port: proxy.peer_port,
+            fwd_cnt: proxy.tx_cnt.0,
+        };
+        push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
+        update.signal_queue = true;
+    }
+
+    let evset = if proxy.pending_tx.is_empty() {
+        EventSet::IN
+    } else {
+        EventSet::IN | EventSet::OUT
+    };
+    update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), evset));
 }
 
 fn get_addr_len(proxy: &super::TsiStreamProxy, addr: &SockaddrStorage) -> Option<u32> {
@@ -373,58 +416,12 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> P
 
     let mut update = ProxyUpdate::default();
 
-    let ret = if let Some(buf) = pkt.buf() {
-        #[cfg(target_os = "macos")]
-        let flags = MsgFlags::empty();
-        #[cfg(target_os = "linux")]
-        let flags = MsgFlags::MSG_NOSIGNAL;
-
-        match send(proxy.fd.as_raw_fd(), buf, flags) {
-            Ok(sent) => {
-                if sent != buf.len() {
-                    error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
-                }
-                proxy.tx_cnt += Wrapping(sent as u32);
-                sent as i32
-            }
-            Err(err) => {
-                warn!(
-                    "error sending data to peer, closing connection: id={}, err={}",
-                    proxy.id, err
-                );
-                proxy.push_reset();
-                proxy.status = ProxyStatus::Closed;
-                update.signal_queue = true;
-                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-                update.remove_proxy = ProxyRemoval::Deferred;
-                #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(err as i32);
-                #[cfg(target_os = "linux")]
-                let errno = -(err as i32);
-                errno
-            }
-        }
-    } else {
-        -libc::EINVAL
+    let Some(buf) = pkt.buf() else {
+        return update;
     };
 
-    if ret > 0 && (proxy.tx_cnt - proxy.last_tx_cnt_sent).0 >= proxy.peer_buf_alloc / 2 {
-        debug!(
-            "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-            proxy.id, proxy.tx_cnt, proxy.last_tx_cnt_sent
-        );
-        proxy.last_tx_cnt_sent = proxy.tx_cnt;
-        // This packet goes to the connection.
-        let rx = MuxerRx::CreditUpdate {
-            local_port: pkt.dst_port(),
-            peer_port: pkt.src_port(),
-            fwd_cnt: proxy.tx_cnt.0,
-        };
-        push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-        update.signal_queue = true;
-    }
-
-    debug!("sendmsg ret={ret}");
+    proxy.pending_tx.extend_from_slice(buf);
+    try_send(proxy, &mut update);
     update
 }
 
@@ -639,6 +636,8 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
             // Stop listening for events in the TCP socket until we receive
             // OP_REQUEST and the vsock transport is fully established.
             update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+        } else if proxy.status == ProxyStatus::Connected {
+            try_send(proxy, &mut update);
         } else {
             debug!("EventSet::OUT while not connecting");
         }

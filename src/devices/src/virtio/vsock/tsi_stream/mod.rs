@@ -51,6 +51,7 @@ pub struct TsiStreamProxy {
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) pending_accepts: u64,
     pub(crate) unixsock_path: Option<PathBuf>,
+    pub(crate) pending_tx: Vec<u8>,
 }
 
 impl TsiStreamProxy {
@@ -91,6 +92,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            pending_tx: Vec::new(),
         })
     }
 
@@ -131,6 +133,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            pending_tx: Vec::new(),
         }
     }
 
