@@ -232,6 +232,16 @@ pub(crate) fn switch_to_connected(proxy: &mut super::TsiStreamProxy) {
     };
 }
 
+pub(crate) fn get_evset(proxy: &super::TsiStreamProxy) -> EventSet {
+    let mut evset = EventSet::empty();
+    let connected = proxy.status == ProxyStatus::Connected;
+    // Preserve upstream READ_HANG_UP (half-close) while restoring SIPB OUT-when-pending_tx.
+    evset.set(EventSet::IN, connected);
+    evset.set(EventSet::READ_HANG_UP, connected);
+    evset.set(EventSet::OUT, !proxy.pending_tx.is_empty());
+    evset
+}
+
 pub(crate) fn try_send(proxy: &mut super::TsiStreamProxy, update: &mut ProxyUpdate) {
     if !proxy.pending_tx.is_empty() {
         #[cfg(target_os = "macos")]
@@ -276,12 +286,7 @@ pub(crate) fn try_send(proxy: &mut super::TsiStreamProxy, update: &mut ProxyUpda
         update.signal_queue = true;
     }
 
-    let evset = if proxy.pending_tx.is_empty() {
-        EventSet::IN
-    } else {
-        EventSet::IN | EventSet::OUT
-    };
-    update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), evset));
+    update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), get_evset(proxy)));
 }
 
 fn get_addr_len(proxy: &super::TsiStreamProxy, addr: &SockaddrStorage) -> Option<u32> {
@@ -498,11 +503,7 @@ pub(crate) fn update_peer_credit(
     proxy.status = ProxyStatus::Connected;
 
     ProxyUpdate {
-        polling: Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::IN | EventSet::READ_HANG_UP,
-        )),
+        polling: Some((proxy.id, proxy.fd.as_raw_fd(), get_evset(proxy))),
         ..Default::default()
     }
 }
@@ -524,11 +525,7 @@ pub(crate) fn process_op_response(
     switch_to_connected(proxy);
 
     ProxyUpdate {
-        polling: Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::IN | EventSet::READ_HANG_UP,
-        )),
+        polling: Some((proxy.id, proxy.fd.as_raw_fd(), get_evset(proxy))),
         push_accept: Some((proxy.id, proxy.parent_id)),
         ..Default::default()
     }
@@ -604,9 +601,12 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
                 update.remove_proxy = ProxyRemoval::Deferred;
                 return update;
-            } else if proxy.host_read_closed || proxy.status == ProxyStatus::WaitingCreditUpdate {
+            } else if proxy.host_read_closed {
                 debug!("process_event: disabling read polling");
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+            } else if proxy.status == ProxyStatus::WaitingCreditUpdate {
+                debug!("process_event: WaitingCreditUpdate");
+                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), get_evset(proxy)));
             }
         } else if proxy.status == ProxyStatus::Listening
             || proxy.status == ProxyStatus::WaitingOnAccept
@@ -636,7 +636,9 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
             // Stop listening for events in the TCP socket until we receive
             // OP_REQUEST and the vsock transport is fully established.
             update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-        } else if proxy.status == ProxyStatus::Connected {
+        } else if proxy.status == ProxyStatus::Connected
+            || proxy.status == ProxyStatus::WaitingCreditUpdate
+        {
             try_send(proxy, &mut update);
         } else {
             debug!("EventSet::OUT while not connecting");
